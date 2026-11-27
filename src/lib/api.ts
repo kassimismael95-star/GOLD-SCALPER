@@ -1,235 +1,146 @@
 
-export const API_BASE_URL = (
+const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ||
   'https://gold-trading-bot-1-15n5.onrender.com'
 ).replace(/\/+$/, '');
 
-const ACCESS_KEY = 'gold-mobile-access-token';
-const REFRESH_KEY = 'gold-mobile-refresh-token';
+const ACCESS_TOKEN_KEY = 'gold_mobile_access_token';
+const REFRESH_TOKEN_KEY = 'gold_mobile_refresh_token';
 
-const REQUEST_TIMEOUT_MS = 25000;
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
-let refreshPromise: Promise<boolean> | null = null;
+type ApiError = Error & {
+  status?: number;
+  data?: unknown;
+};
 
-export type ApiMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
-
-function readStorage(key: string): string | null {
-  try {
-    return window.sessionStorage.getItem(key);
-  } catch {
-    return null;
-  }
+function getAccessToken(): string | null {
+  return sessionStorage.getItem(ACCESS_TOKEN_KEY);
 }
 
-function writeStorage(key: string, value: string): void {
-  try {
-    window.sessionStorage.setItem(key, value);
-  } catch {
-    throw new Error('Your browser could not save the login session.');
-  }
-}
-
-function removeStorage(key: string): void {
-  try {
-    window.sessionStorage.removeItem(key);
-  } catch {
-    // Storage may be unavailable.
-  }
-}
-
-export function getAccessToken(): string | null {
-  return readStorage(ACCESS_KEY);
-}
-
-export function getRefreshToken(): string | null {
-  return readStorage(REFRESH_KEY);
+function getRefreshToken(): string | null {
+  return sessionStorage.getItem(REFRESH_TOKEN_KEY);
 }
 
 export function saveTokens(
   accessToken: string,
-  refreshToken?: string
+  refreshToken?: string | null
 ): void {
   if (!accessToken) {
-    throw new Error('The server returned an empty access token.');
+    throw new Error('The server did not provide an access token.');
   }
 
-  writeStorage(ACCESS_KEY, accessToken);
+  sessionStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
 
   if (refreshToken) {
-    writeStorage(REFRESH_KEY, refreshToken);
+    sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
   }
 }
 
-export function clearTokens(): void {
-  removeStorage(ACCESS_KEY);
-  removeStorage(REFRESH_KEY);
+function clearTokens(): void {
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
 }
 
-interface ApiErrorPayload {
-  error?: string;
-  message?: string;
-  detail?: string;
-}
+async function readResponse(response: Response): Promise<any> {
+  const text = await response.text();
 
-function readableError(value: unknown, status: number): string {
-  if (value && typeof value === 'object') {
-    const data = value as ApiErrorPayload;
+  if (!text) return {};
 
-    const message =
-      data.error ||
-      data.message ||
-      data.detail;
-
-    if (typeof message === 'string' && message.trim()) {
-      return message
-        .replaceAll('_', ' ')
-        .replace(/^\w/, letter => letter.toUpperCase());
-    }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { message: text };
   }
+}
 
-  const defaults: Record<number, string> = {
-    400: 'The submitted information is invalid.',
-    401: 'Your session has expired. Please sign in again.',
-    403: 'You do not have permission to perform this action.',
-    404: 'The requested service or feature was not found.',
-    409: 'This action conflicts with your current account status.',
-    429: 'Too many requests. Please wait and try again.',
-    500: 'The server encountered an internal error.',
-    502: 'The server gateway is temporarily unavailable.',
-    503: 'The service is temporarily unavailable.',
-  };
-
-  return defaults[status] || `Server error (${status}).`;
+function makeError(
+  message: string,
+  status?: number,
+  data?: unknown
+): ApiError {
+  const error = new Error(message) as ApiError;
+  error.status = status;
+  error.data = data;
+  return error;
 }
 
 async function rawRequest<T>(
   path: string,
-  method: ApiMethod,
+  method: HttpMethod,
   body?: unknown,
   token?: string | null
 ): Promise<T> {
-  const controller = new AbortController();
-
-  const timeout = window.setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT_MS
-  );
-
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-  };
-
-  if (body !== undefined) {
-    headers['Content-Type'] = 'application/json';
-  }
-
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
+  let response: Response;
 
   try {
-    const response = await fetch(`${API_BASE_URL}${path}`, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       method,
-      headers,
-      body: body === undefined
-        ? undefined
-        : JSON.stringify(body),
-      credentials: 'omit',
-      cache: 'no-store',
-      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(body !== undefined
+          ? { 'Content-Type': 'application/json' }
+          : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      cache: 'no-store'
     });
-
-    const responseText = await response.text();
-
-    let data: unknown = {};
-
-    if (responseText) {
-      try {
-        data = JSON.parse(responseText);
-      } catch {
-        data = {
-          error: responseText.slice(0, 300),
-        };
-      }
-    }
-
-    if (!response.ok) {
-      const error = new Error(
-        readableError(data, response.status)
-      );
-
-      Object.assign(error, {
-        status: response.status,
-        data,
-      });
-
-      throw error;
-    }
-
-    return data as T;
-  } catch (error) {
-    if (error instanceof Error) {
-      if (error.name === 'AbortError') {
-        throw new Error(
-          'The server took too long to respond. Please try again.'
-        );
-      }
-
-      if ('status' in error) {
-        throw error;
-      }
-
-      if (
-        error.message.toLowerCase().includes('failed to fetch') ||
-        error.message.toLowerCase().includes('networkerror')
-      ) {
-        throw new Error(
-          'Cannot reach the trading server. Check the internet connection and server CORS settings.'
-        );
-      }
-
-      throw error;
-    }
-
-    throw new Error('An unexpected network error occurred.');
-  } finally {
-    window.clearTimeout(timeout);
+  } catch {
+    throw makeError(
+      'Cannot reach the trading server. Check your internet connection or try again later.'
+    );
   }
+
+  const data = await readResponse(response);
+
+  if (!response.ok) {
+    const message =
+      data?.message ||
+      data?.error ||
+      data?.detail ||
+      `Server request failed (${response.status}).`;
+
+    throw makeError(message, response.status, data);
+  }
+
+  return data as T;
 }
 
-async function refreshAccessToken(): Promise<boolean> {
+let refreshPromise: Promise<string | null> | null = null;
+
+async function refreshAccessToken(): Promise<string | null> {
+  const refreshToken = getRefreshToken();
+
+  if (!refreshToken) {
+    clearTokens();
+    return null;
+  }
+
   if (refreshPromise) {
     return refreshPromise;
   }
 
-  const refreshToken = getRefreshToken();
-
-  if (!refreshToken) {
-    return false;
-  }
-
   refreshPromise = (async () => {
     try {
-      const result = await rawRequest<{
-        access_token?: string;
-      }>(
+      const data = await rawRequest<any>(
         '/api/auth/refresh',
         'POST',
         undefined,
         refreshToken
       );
 
-      if (!result.access_token) {
+      if (!data?.access_token) {
         clearTokens();
-        return false;
+        return null;
       }
 
-      saveTokens(result.access_token);
+      saveTokens(data.access_token, data.refresh_token || refreshToken);
 
-      return true;
+      return data.access_token;
     } catch {
       clearTokens();
-      return false;
+      return null;
     } finally {
       refreshPromise = null;
     }
@@ -238,75 +149,94 @@ async function refreshAccessToken(): Promise<boolean> {
   return refreshPromise;
 }
 
-export async function api<T = any>(
-  path: string,
-  method: ApiMethod = 'GET',
-  body?: unknown,
-  requiresAuth = true
-): Promise<T> {
-  let token = requiresAuth
-    ? getAccessToken()
-    : null;
+export async function restoreSession(): Promise<boolean> {
+  const accessToken = getAccessToken();
 
-  if (requiresAuth && !token) {
-    const refreshed = await refreshAccessToken();
-
-    if (!refreshed) {
-      throw new Error(
-        'Your session has expired. Please sign in again.'
+  if (accessToken) {
+    try {
+      await rawRequest(
+        '/api/licences/status',
+        'GET',
+        undefined,
+        accessToken
       );
-    }
 
-    token = getAccessToken();
+      return true;
+    } catch (error) {
+      const status = (error as ApiError).status;
+
+      if (status !== 401) {
+        // A temporary server error does not prove the session is invalid.
+        return true;
+      }
+    }
+  }
+
+  const refreshedToken = await refreshAccessToken();
+
+  if (!refreshedToken) {
+    clearTokens();
+    return false;
   }
 
   try {
-    return await rawRequest<T>(
-      path,
-      method,
-      body,
-      token
+    await rawRequest(
+      '/api/licences/status',
+      'GET',
+      undefined,
+      refreshedToken
     );
+
+    return true;
   } catch (error) {
-    const status =
-      error &&
-      typeof error === 'object' &&
-      'status' in error
-        ? Number((error as { status: number }).status)
-        : 0;
-
-    if (
-      requiresAuth &&
-      status === 401
-    ) {
-      const refreshed = await refreshAccessToken();
-
-      if (refreshed) {
-        return rawRequest<T>(
-          path,
-          method,
-          body,
-          getAccessToken()
-        );
-      }
-
+    if ((error as ApiError).status === 401) {
       clearTokens();
-
-      throw new Error(
-        'Your session expired. Please sign in again.'
-      );
+      return false;
     }
 
-    throw error;
+    return true;
   }
 }
 
-export async function restoreSession(): Promise<boolean> {
-  if (getAccessToken()) {
-    return true;
+export async function api<T = any>(
+  path: string,
+  method: HttpMethod = 'GET',
+  body?: unknown,
+  requiresAuth = true
+): Promise<T> {
+  if (!requiresAuth) {
+    return rawRequest<T>(path, method, body);
   }
 
-  return refreshAccessToken();
+  let token = getAccessToken();
+
+  if (!token) {
+    token = await refreshAccessToken();
+  }
+
+  if (!token) {
+    clearTokens();
+    throw makeError('Your session has expired. Please sign in again.', 401);
+  }
+
+  try {
+    return await rawRequest<T>(path, method, body, token);
+  } catch (error) {
+    const status = (error as ApiError).status;
+
+    if (status !== 401) {
+      throw error;
+    }
+
+    const newToken = await refreshAccessToken();
+
+    if (!newToken) {
+      clearTokens();
+      throw makeError('Your session has expired. Please sign in again.', 401);
+    }
+
+    return rawRequest<T>(path, method, body, newToken);
+  }
 }
 
 export async function logout(): Promise<void> {
@@ -318,15 +248,30 @@ export async function logout(): Promise<void> {
       await rawRequest(
         '/api/auth/logout',
         'POST',
-        {
-          refresh_token: refreshToken || '',
-        },
+        {},
         accessToken
       );
     }
   } catch {
-    // Always clear local credentials even if the server is offline.
-  } finally {
-    clearTokens();
+    // Always clear the local session, even if the server is unreachable.
   }
+
+  try {
+    if (refreshToken) {
+      await rawRequest(
+        '/api/auth/logout-refresh',
+        'POST',
+        {},
+        refreshToken
+      );
+    }
+  } catch {
+    // The local session is still cleared below.
+  }
+
+  clearTokens();
+}
+
+export function getApiBaseUrl(): string {
+  return API_BASE_URL;
 }
