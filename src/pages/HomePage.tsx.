@@ -1,0 +1,57 @@
+
+import { isNumber, isRecord } from '@/lib/guards';
+
+export interface AccountTelemetry {
+  connected_to_broker: boolean;
+  balance: number;
+  equity: number;
+  floating_pnl: number;
+  open_positions_count: number;
+  last_updated: string;
+}
+
+export interface BackendStatusResponse {
+  status: string;
+  active_accounts: string[];
+  telemetry: Record<string, AccountTelemetry>;
+}
+
+export interface Mt5Status {
+  accountId: number | null;
+  hasAccount: boolean;
+  login: string | null;
+  server: string | null;
+  symbol: string | null;
+  connected: boolean;
+  botStatus: 'running' | 'stopped';
+  lastUpdated: string | null;
+  balance: number | null;
+  equity: number | null;
+  floatingPnl: number | null;
+  openPositions: number | null;
+}
+
+function isAccountTelemetry(value: unknown): value is AccountTelemetry {
+  return (
+    isRecord(value) &&
+    typeof value.connected_to_broker === 'boolean' &&
+    isNumber(value.balance) &&
+    isNumber(value.equity) &&
+    isNumber(value.floating_pnl) &&
+    isNumber(value.open_positions_count) &&
+    typeof value.last_updated === 'string'
+  );
+}
+
+export function isBackendStatusResponse(
+  value: unknown
+): value is BackendStatusResponse {
+  return (
+    isRecord(value) &&
+    typeof value.status === 'string' &&
+    Array.isArray(value.active_accounts) &&
+    value.active_accounts.every((login) => typeof login === 'string') &&
+    isRecord(value.telemetry) &&
+    Object.values(value.telemetry).every(isAccountTelemetry)
+  );
+}
