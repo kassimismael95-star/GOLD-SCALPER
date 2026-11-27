@@ -1,3 +1,4 @@
+
 import {
   useCallback,
   useEffect,
@@ -61,6 +62,14 @@ type Entitlement = {
   expires_at: string | null;
   trial_uses?: number;
   trial_uses_remaining?: number;
+  paid_subscription_active?: boolean;
+};
+
+type SubscriptionPlan = {
+  plan_code: 'PLAN_15D' | 'PLAN_33D' | 'PLAN_70D';
+  amount: number;
+  currency: string;
+  duration_days: number;
 };
 
 type Credentials = {
@@ -72,8 +81,17 @@ type Credentials = {
   password: string;
 };
 
+const VALID_LICENSES = [
+  'BOSSMODE98',
+  'BOSSMODE99',
+  'BOSSMODE01D',
+  'BOSSMODE30D',
+];
+
 const money = (value: unknown) => {
-  if (value === null || value === undefined || value === '') return '—';
+  if (value === null || value === undefined || value === '') {
+    return '—';
+  }
 
   const number = Number(value);
 
@@ -423,6 +441,11 @@ export default function App() {
   const [busyAction, setBusyAction] = useState('');
 
   const [license, setLicense] = useState('');
+  const [availablePlans, setAvailablePlans] = useState<SubscriptionPlan[]>([]);
+  const [selectedPlanCode, setSelectedPlanCode] =
+    useState<SubscriptionPlan['plan_code']>('PLAN_15D');
+  const [showPlanSelection, setShowPlanSelection] = useState(false);
+
   const [showCreate, setShowCreate] = useState(false);
   const [newToken, setNewToken] = useState('');
 
@@ -438,9 +461,12 @@ export default function App() {
   }));
 
   const selected = useMemo(
-    () => accounts.find((account) => String(account.id) === String(selectedId))
-      || accounts[0]
-      || null,
+    () =>
+      accounts.find(
+        (account) => String(account.id) === String(selectedId)
+      ) ||
+      accounts[0] ||
+      null,
     [accounts, selectedId]
   );
 
@@ -472,7 +498,9 @@ export default function App() {
       setSelectedId((current) => {
         if (
           current !== null &&
-          rows.some((account) => String(account.id) === String(current))
+          rows.some(
+            (account) => String(account.id) === String(current)
+          )
         ) {
           return current;
         }
@@ -482,12 +510,9 @@ export default function App() {
 
       setEntitlement(licenceResult);
 
-      if (licenceResult.active) {
-        setPage((current) =>
-          current === 'activation' ? 'activation' : current
-        );
-      } else {
+      if (!licenceResult.active) {
         setPage('activation');
+        setShowPlanSelection(false);
       }
     } catch (error) {
       setError(getError(error));
@@ -500,12 +525,19 @@ export default function App() {
     let alive = true;
 
     (async () => {
-      const valid = await restoreSession();
+      try {
+        const valid = await restoreSession();
 
-      if (!alive) return;
+        if (!alive) return;
 
-      setAuthenticated(valid);
-      setChecking(false);
+        setAuthenticated(valid);
+      } catch {
+        if (!alive) return;
+
+        setAuthenticated(false);
+      } finally {
+        if (alive) setChecking(false);
+      }
     })();
 
     return () => {
@@ -553,28 +585,7 @@ export default function App() {
         throw new Error('Enter your license key.');
       }
 
-      if (code === 'BOSSMODE30D') {
-        const result = await api<any>(
-          '/api/payments/flutterwave/initialize',
-          'POST',
-          {
-            plan_code: 'BOSSMODE30D',
-          }
-        );
-
-        if (!result.checkout_url) {
-          throw new Error(
-            'The payment server did not return a checkout link.'
-          );
-        }
-
-        window.location.assign(result.checkout_url);
-        return;
-      }
-
-      if (
-        !['BOSSMODE98', 'BOSSMODE99', 'BOSSMODE01D'].includes(code)
-      ) {
+      if (!VALID_LICENSES.includes(code)) {
         throw new Error('This license key is not recognized.');
       }
 
@@ -584,11 +595,59 @@ export default function App() {
         { code }
       );
 
+      if (code === 'BOSSMODE30D') {
+        if (result.status === 'ACTIVE' && result.already_active) {
+          setLicense('');
+          setShowPlanSelection(false);
+          setAvailablePlans([]);
+
+          await loadData();
+
+          setPage('home');
+          say('Your paid subscription is already active. Welcome back.', true);
+          return;
+        }
+
+        if (
+          result.status === 'PLAN_SELECTION_REQUIRED' &&
+          result.requires_plan_selection === true
+        ) {
+          if (!Array.isArray(result.plans) || result.plans.length === 0) {
+            throw new Error(
+              'The server did not return any available subscription plans.'
+            );
+          }
+
+          const allowedPlans = result.plans.filter(
+            (plan: SubscriptionPlan) =>
+              ['PLAN_15D', 'PLAN_33D', 'PLAN_70D'].includes(plan.plan_code)
+          );
+
+          if (allowedPlans.length === 0) {
+            throw new Error('No valid subscription plans were returned.');
+          }
+
+          setAvailablePlans(allowedPlans);
+          setSelectedPlanCode(allowedPlans[0].plan_code);
+          setShowPlanSelection(true);
+          setLicense('');
+
+          say('Choose a subscription plan to continue.', true);
+          return;
+        }
+
+        throw new Error(
+          result.error ||
+            'The server could not verify your subscription status.'
+        );
+      }
+
       if (result.active === false) {
         throw new Error('The server did not confirm an active license.');
       }
 
       setLicense('');
+      setShowPlanSelection(false);
 
       await loadData();
 
@@ -596,6 +655,38 @@ export default function App() {
         `License ${result.code || code} was accepted by the server.`,
         true
       );
+    });
+
+  const purchaseSubscription = () =>
+    run('payment', async () => {
+      if (!availablePlans.length) {
+        throw new Error('No subscription plans are available.');
+      }
+
+      const selectedPlan = availablePlans.find(
+        (plan) => plan.plan_code === selectedPlanCode
+      );
+
+      if (!selectedPlan) {
+        throw new Error('Select a valid subscription plan.');
+      }
+
+      const result = await api<any>(
+        '/api/payments/flutterwave/initialize',
+        'POST',
+        {
+          plan_code: selectedPlan.plan_code,
+          currency: selectedPlan.currency,
+        }
+      );
+
+      if (!result.checkout_url) {
+        throw new Error(
+          'The payment server did not return a checkout link.'
+        );
+      }
+
+      window.location.assign(result.checkout_url);
     });
 
   const createAccount = () =>
@@ -722,6 +813,8 @@ export default function App() {
       setEntitlement(null);
       setSelectedId(null);
       setPage('activation');
+      setShowPlanSelection(false);
+      setAvailablePlans([]);
     });
 
   const refresh = () =>
@@ -754,7 +847,7 @@ export default function App() {
 
   const connected = Boolean(
     selected?.telemetry?.connected_to_broker &&
-    selected?.actual_state !== 'STALE'
+      selected?.actual_state !== 'STALE'
   );
 
   const running = selected?.desired_state === 'RUNNING';
@@ -803,19 +896,27 @@ export default function App() {
             {error && <Message text={error} />}
             {notice && <Message text={notice} ok={noticeOk} />}
 
-            <div className={`panel license-panel ${hasEntitlement ? 'active' : ''}`}>
+            <div
+              className={`panel license-panel ${
+                hasEntitlement ? 'active' : ''
+              }`}
+            >
               <div className="row">
                 <span className="icon-bubble">
                   <LockKeyhole />
                 </span>
 
                 <div>
-                  <h2>{hasEntitlement ? 'License Active' : 'Enter License Key'}</h2>
+                  <h2>
+                    {hasEntitlement
+                      ? 'License Active'
+                      : 'Enter License Key'}
+                  </h2>
 
                   <p className="muted">
                     {hasEntitlement
                       ? `Your ${entitlement?.code || 'license'} is active.`
-                      : 'Enter your assigned VIP key, trial key, or paid subscription key.'}
+                      : 'Enter your VIP key, trial key, or paid subscription key.'}
                   </p>
                 </div>
               </div>
@@ -842,25 +943,79 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  <Field
-                    label="LICENSE KEY"
-                    value={license}
-                    onChange={setLicense}
-                    placeholder="Enter your license key"
-                  />
+                  {!showPlanSelection ? (
+                    <>
+                      <Field
+                        label="LICENSE KEY"
+                        value={license}
+                        onChange={setLicense}
+                        placeholder="Enter your license key"
+                      />
 
-                  <Button
-                    busy={busyAction === 'license'}
-                    onClick={() => void activateLicense()}
-                    icon={<KeyRound size={18} />}
-                  >
-                    Activate / Continue
-                  </Button>
+                      <Button
+                        busy={busyAction === 'license'}
+                        onClick={() => void activateLicense()}
+                        icon={<KeyRound size={18} />}
+                      >
+                        Activate / Continue
+                      </Button>
 
-                  <p className="muted small">
-                    VIP and trial keys are checked directly. BOSSMODE30D
-                    opens the paid checkout flow.
-                  </p>
+                      <p className="muted small">
+                        Enter your VIP key, trial key, or BOSSMODE30D
+                        subscription key.
+                      </p>
+                    </>
+                  ) : (
+                    <div className="stack">
+                      <h3>Choose Your Subscription</h3>
+
+                      <p className="muted">
+                        Select a plan. You will be redirected to Flutterwave
+                        to complete payment.
+                      </p>
+
+                      {availablePlans.map((plan) => (
+                        <button
+                          type="button"
+                          key={plan.plan_code}
+                          className={`account-choice ${
+                            selectedPlanCode === plan.plan_code
+                              ? 'selected'
+                              : ''
+                          }`}
+                          onClick={() =>
+                            setSelectedPlanCode(plan.plan_code)
+                          }
+                        >
+                          <b>
+                            {plan.duration_days} Days — {plan.currency}{' '}
+                            {plan.amount}
+                          </b>
+                          <span>{plan.plan_code}</span>
+                        </button>
+                      ))}
+
+                      <Button
+                        busy={busyAction === 'payment'}
+                        disabled={!selectedPlanCode}
+                        onClick={() => void purchaseSubscription()}
+                        icon={<Wallet size={18} />}
+                      >
+                        Continue to Secure Payment
+                      </Button>
+
+                      <Button
+                        kind="outline"
+                        onClick={() => {
+                          setShowPlanSelection(false);
+                          setAvailablePlans([]);
+                          setNotice('');
+                        }}
+                      >
+                        Back
+                      </Button>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -900,7 +1055,9 @@ export default function App() {
                       kind="outline"
                       onClick={() => setShowCreate((value) => !value)}
                     >
-                      {showCreate ? 'Cancel' : 'Add another MT5 account'}
+                      {showCreate
+                        ? 'Cancel'
+                        : 'Add another MT5 account'}
                     </Button>
                   </div>
                 )}
@@ -908,7 +1065,9 @@ export default function App() {
                 {(!selected || showCreate) && (
                   <div className="panel stack">
                     <h2>
-                      {selected ? 'Add MT5 Account' : 'Connect MT5 Account'}
+                      {selected
+                        ? 'Add MT5 Account'
+                        : 'Connect MT5 Account'}
                     </h2>
 
                     <Field
@@ -976,7 +1135,9 @@ export default function App() {
                       <div className="segmented">
                         <button
                           type="button"
-                          className={accountMode === 'demo' ? 'selected' : ''}
+                          className={
+                            accountMode === 'demo' ? 'selected' : ''
+                          }
                           onClick={() => setAccountMode('demo')}
                         >
                           DEMO
@@ -984,7 +1145,9 @@ export default function App() {
 
                         <button
                           type="button"
-                          className={accountMode === 'live' ? 'selected' : ''}
+                          className={
+                            accountMode === 'live' ? 'selected' : ''
+                          }
                           onClick={() => setAccountMode('live')}
                         >
                           REAL
@@ -1031,10 +1194,15 @@ export default function App() {
                     <Info label="LOGIN ID" value={selected.login} />
                     <Info label="SERVER" value={selected.server} />
                     <Info label="SYMBOL" value={selected.symbol} />
-                    <Info label="MODE" value={selected.mode.toUpperCase()} />
+                    <Info
+                      label="MODE"
+                      value={selected.mode.toUpperCase()}
+                    />
                     <Info
                       label="CONNECTION"
-                      value={connected ? 'CONNECTED' : 'WAITING FOR MT5'}
+                      value={
+                        connected ? 'CONNECTED' : 'WAITING FOR MT5'
+                      }
                     />
 
                     <Field
@@ -1101,7 +1269,13 @@ export default function App() {
 
               <Metric
                 label="Bot Status"
-                value={!selected ? 'NO ACCOUNT' : running ? 'RUNNING' : 'STOPPED'}
+                value={
+                  !selected
+                    ? 'NO ACCOUNT'
+                    : running
+                      ? 'RUNNING'
+                      : 'STOPPED'
+                }
                 icon={<Bot />}
                 good={running}
               />
@@ -1140,7 +1314,8 @@ export default function App() {
                 >
                   {accounts.map((account) => (
                     <option key={account.id} value={account.id}>
-                      {account.label} · {account.mode.toUpperCase()} · {account.login}
+                      {account.label} · {account.mode.toUpperCase()} ·{' '}
+                      {account.login}
                     </option>
                   ))}
                 </select>
@@ -1218,7 +1393,8 @@ export default function App() {
               </p>
 
               <p className="muted small">
-                Last update: {formatTime(telemetry?.updated_at || selected?.last_seen)}
+                Last update:{' '}
+                {formatTime(telemetry?.updated_at || selected?.last_seen)}
               </p>
             </div>
           </section>
@@ -1249,7 +1425,10 @@ export default function App() {
               <h3>MT5 ACCOUNT</h3>
               <Info label="Login ID" value={selected?.login || '—'} />
               <Info label="Broker server" value={selected?.server || '—'} />
-              <Info label="Mode" value={selected?.mode?.toUpperCase() || '—'} />
+              <Info
+                label="Mode"
+                value={selected?.mode?.toUpperCase() || '—'}
+              />
             </div>
 
             <Button
@@ -1329,4 +1508,4 @@ function Info({ label, value }: { label: string; value: string }) {
       <b>{value}</b>
     </div>
   );
-    }
+}
