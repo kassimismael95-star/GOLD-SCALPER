@@ -1,277 +1,197 @@
-
 const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ||
   'https://gold-trading-bot-1-15n5.onrender.com'
 ).replace(/\/+$/, '');
 
-const ACCESS_TOKEN_KEY = 'gold_mobile_access_token';
-const REFRESH_TOKEN_KEY = 'gold_mobile_refresh_token';
+const ACCESS_KEY = 'gold_mobile_access_token';
+const REFRESH_KEY = 'gold_mobile_refresh_token';
 
-type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 
-type ApiError = Error & {
-  status?: number;
-  data?: unknown;
-};
+let refreshInProgress: Promise<boolean> | null = null;
 
-function getAccessToken(): string | null {
-  return sessionStorage.getItem(ACCESS_TOKEN_KEY);
-}
-
-function getRefreshToken(): string | null {
-  return sessionStorage.getItem(REFRESH_TOKEN_KEY);
+export function getApiBaseUrl(): string {
+  return API_BASE_URL;
 }
 
 export function saveTokens(
   accessToken: string,
-  refreshToken?: string | null
+  refreshToken?: string
 ): void {
   if (!accessToken) {
-    throw new Error('The server did not provide an access token.');
+    throw new Error('The server did not return an access token.');
   }
 
-  sessionStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
+  sessionStorage.setItem(ACCESS_KEY, accessToken);
 
   if (refreshToken) {
-    sessionStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+    sessionStorage.setItem(REFRESH_KEY, refreshToken);
   }
+}
+
+function getAccessToken(): string | null {
+  return sessionStorage.getItem(ACCESS_KEY);
 }
 
 function clearTokens(): void {
-  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
-  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+  sessionStorage.removeItem(ACCESS_KEY);
+  sessionStorage.removeItem(REFRESH_KEY);
 }
 
-async function readResponse(response: Response): Promise<any> {
-  const text = await response.text();
+async function refreshAccessToken(): Promise<boolean> {
+  const refreshToken = sessionStorage.getItem(REFRESH_KEY);
 
-  if (!text) return {};
-
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { message: text };
+  if (!refreshToken) {
+    clearTokens();
+    return false;
   }
+
+  if (refreshInProgress) {
+    return refreshInProgress;
+  }
+
+  refreshInProgress = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/refresh`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${refreshToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || !data.access_token) {
+        clearTokens();
+        return false;
+      }
+
+      saveTokens(data.access_token, data.refresh_token || refreshToken);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      refreshInProgress = null;
+    }
+  })();
+
+  return refreshInProgress;
 }
 
-function makeError(
-  message: string,
-  status?: number,
-  data?: unknown
-): ApiError {
-  const error = new Error(message) as ApiError;
-  error.status = status;
-  error.data = data;
-  return error;
-}
-
-async function rawRequest<T>(
+async function request<T>(
   path: string,
   method: HttpMethod,
   body?: unknown,
-  token?: string | null
+  requiresAuth = true,
+  retry = true
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+  };
+
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const token = getAccessToken();
+
+  if (requiresAuth && token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
   let response: Response;
 
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       method,
-      headers: {
-        Accept: 'application/json',
-        ...(body !== undefined
-          ? { 'Content-Type': 'application/json' }
-          : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {})
-      },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      cache: 'no-store'
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
-    throw makeError(
-      'Cannot reach the trading server. Check your internet connection or try again later.'
+    throw new Error(
+      'Cannot reach the trading server. Check your internet connection and try again.'
     );
   }
 
-  const data = await readResponse(response);
+  if (response.status === 401 && requiresAuth && retry) {
+    const refreshed = await refreshAccessToken();
+
+    if (refreshed) {
+      return request<T>(path, method, body, requiresAuth, false);
+    }
+
+    clearTokens();
+    throw new Error('Your session has expired. Please sign in again.');
+  }
+
+  const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
     const message =
-      data?.message ||
-      data?.error ||
-      data?.detail ||
-      `Server request failed (${response.status}).`;
+      data.message ||
+      data.error ||
+      data.detail ||
+      `Request failed (${response.status}).`;
 
-    throw makeError(message, response.status, data);
+    throw new Error(message);
   }
 
   return data as T;
 }
 
-let refreshPromise: Promise<string | null> | null = null;
-
-async function refreshAccessToken(): Promise<string | null> {
-  const refreshToken = getRefreshToken();
-
-  if (!refreshToken) {
-    clearTokens();
-    return null;
-  }
-
-  if (refreshPromise) {
-    return refreshPromise;
-  }
-
-  refreshPromise = (async () => {
-    try {
-      const data = await rawRequest<any>(
-        '/api/auth/refresh',
-        'POST',
-        undefined,
-        refreshToken
-      );
-
-      if (!data?.access_token) {
-        clearTokens();
-        return null;
-      }
-
-      saveTokens(data.access_token, data.refresh_token || refreshToken);
-
-      return data.access_token;
-    } catch {
-      clearTokens();
-      return null;
-    } finally {
-      refreshPromise = null;
-    }
-  })();
-
-  return refreshPromise;
-}
-
-export async function restoreSession(): Promise<boolean> {
-  const accessToken = getAccessToken();
-
-  if (accessToken) {
-    try {
-      await rawRequest(
-        '/api/licences/status',
-        'GET',
-        undefined,
-        accessToken
-      );
-
-      return true;
-    } catch (error) {
-      const status = (error as ApiError).status;
-
-      if (status !== 401) {
-        // A temporary server error does not prove the session is invalid.
-        return true;
-      }
-    }
-  }
-
-  const refreshedToken = await refreshAccessToken();
-
-  if (!refreshedToken) {
-    clearTokens();
-    return false;
-  }
-
-  try {
-    await rawRequest(
-      '/api/licences/status',
-      'GET',
-      undefined,
-      refreshedToken
-    );
-
-    return true;
-  } catch (error) {
-    if ((error as ApiError).status === 401) {
-      clearTokens();
-      return false;
-    }
-
-    return true;
-  }
-}
-
-export async function api<T = any>(
+export function api<T>(
   path: string,
   method: HttpMethod = 'GET',
   body?: unknown,
   requiresAuth = true
 ): Promise<T> {
-  if (!requiresAuth) {
-    return rawRequest<T>(path, method, body);
-  }
+  return request<T>(path, method, body, requiresAuth);
+}
 
-  let token = getAccessToken();
-
-  if (!token) {
-    token = await refreshAccessToken();
-  }
-
-  if (!token) {
-    clearTokens();
-    throw makeError('Your session has expired. Please sign in again.', 401);
+export async function restoreSession(): Promise<boolean> {
+  if (!getAccessToken() && !sessionStorage.getItem(REFRESH_KEY)) {
+    return false;
   }
 
   try {
-    return await rawRequest<T>(path, method, body, token);
+    await api('/api/licences/status', 'GET');
+    return true;
   } catch (error) {
-    const status = (error as ApiError).status;
-
-    if (status !== 401) {
-      throw error;
+    if (
+      error instanceof Error &&
+      error.message.toLowerCase().includes('session has expired')
+    ) {
+      return false;
     }
 
-    const newToken = await refreshAccessToken();
-
-    if (!newToken) {
-      clearTokens();
-      throw makeError('Your session has expired. Please sign in again.', 401);
-    }
-
-    return rawRequest<T>(path, method, body, newToken);
+    return false;
   }
 }
 
 export async function logout(): Promise<void> {
   const accessToken = getAccessToken();
-  const refreshToken = getRefreshToken();
+  const refreshToken = sessionStorage.getItem(REFRESH_KEY);
 
   try {
     if (accessToken) {
-      await rawRequest(
-        '/api/auth/logout',
-        'POST',
-        {},
-        accessToken
-      );
+      await fetch(`${API_BASE_URL}/api/auth/logout`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
     }
-  } catch {
-    // Always clear the local session, even if the server is unreachable.
-  }
 
-  try {
     if (refreshToken) {
-      await rawRequest(
-        '/api/auth/logout-refresh',
-        'POST',
-        {},
-        refreshToken
-      );
+      await fetch(`${API_BASE_URL}/api/auth/logout-refresh`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${refreshToken}`,
+        },
+      });
     }
-  } catch {
-    // The local session is still cleared below.
+  } finally {
+    clearTokens();
   }
-
-  clearTokens();
-}
-
-export function getApiBaseUrl(): string {
-  return API_BASE_URL;
 }
